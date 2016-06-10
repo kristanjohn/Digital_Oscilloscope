@@ -1,0 +1,384 @@
+/*
+ * os_dac.c
+ *
+ *  Created on: 3 May 2016
+ *      Author: Kristan Edwards
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "inc/hw_memmap.h"
+#include "inc/hw_types.h"
+
+#include "driverlib/debug.h"
+#include "driverlib/gpio.h"
+#include "driverlib/adc.h"
+//#include "driverlib/pin_map.h"
+#include "driverlib/rom_map.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/uart.h"
+#include "driverlib/interrupt.h"
+#include "driverlib/timer.h"
+
+#include <xdc/runtime/Types.h>
+#include <ti/sysbios/knl/Clock.h>
+
+/* XDCtools Header files */
+#include <xdc/std.h>
+#include <xdc/cfg/global.h>
+#include <xdc/runtime/Error.h>
+#include <xdc/runtime/System.h>
+
+/* BIOS Header files */
+#include <ti/sysbios/BIOS.h>
+#include <ti/sysbios/knl/Task.h>
+
+#include "utils/uartstdio.h"
+#include "utils/ustdlib.h"
+#include "os_dac.h"
+
+#include "inc/tm4c1294ncpdt.h"
+#include "os_PacketTypes.h"
+
+#define SINE TYPE_FUNC_SINE
+#define SQUARE TYPE_FUNC_SQUARE
+#define RAMP TYPE_FUNC_RAMP
+#define TRIANGLE TYPE_FUNC_TRIG
+#define RANDOM	TYPE_FUNC_RANDOM
+#define OFF 1
+
+/* Global variables */
+volatile int userIntIndex = 0;
+volatile int userIntIndexSR = 0;
+volatile int TurnOnDac = 0;
+volatile int PeriodIndex = 0;		// Tracks the time within a period
+int IntsPerPeriod = 100; 			// No. Interrupts per period
+int Amplitude = 0xFF;				// Store Amplitude
+int WaveType = SINE;				// Store Wavetype
+int Frequency = 0;					// Store Frequency
+
+/* Protypes */
+extern void InterruptUser(void);
+
+// 8-bit 256 point sine wave
+static const uint8_t sine_look_up_table[256] = { 0x80,0x83,0x86,0x89,0x8c,0x8f,0x92,0x95,
+		0x98,0x9c,0x9f,0xa2,0xa5,0xa8,0xab,0xae,
+		0xb0,0xb3,0xb6,0xb9,0xbc,0xbf,0xc1,0xc4,
+		0xc7,0xc9,0xcc,0xce,0xd1,0xd3,0xd5,0xd8,
+		0xda,0xdc,0xde,0xe0,0xe2,0xe4,0xe6,0xe8,
+		0xea,0xeb,0xed,0xef,0xf0,0xf2,0xf3,0xf4,
+		0xf6,0xf7,0xf8,0xf9,0xfa,0xfb,0xfb,0xfc,
+		0xfd,0xfd,0xfe,0xfe,0xfe,0xff,0xff,0xff,
+		0xff,0xff,0xff,0xff,0xfe,0xfe,0xfd,0xfd,
+		0xfc,0xfc,0xfb,0xfa,0xf9,0xf8,0xf7,0xf6,
+		0xf5,0xf4,0xf2,0xf1,0xef,0xee,0xec,0xeb,
+		0xe9,0xe7,0xe5,0xe3,0xe1,0xdf,0xdd,0xdb,
+		0xd9,0xd7,0xd4,0xd2,0xcf,0xcd,0xca,0xc8,
+		0xc5,0xc3,0xc0,0xbd,0xba,0xb8,0xb5,0xb2,
+		0xaf,0xac,0xa9,0xa6,0xa3,0xa0,0x9d,0x9a,
+		0x97,0x94,0x91,0x8e,0x8a,0x87,0x84,0x81,
+		0x7e,0x7b,0x78,0x75,0x71,0x6e,0x6b,0x68,
+		0x65,0x62,0x5f,0x5c,0x59,0x56,0x53,0x50,
+		0x4d,0x4a,0x47,0x45,0x42,0x3f,0x3c,0x3a,
+		0x37,0x35,0x32,0x30,0x2d,0x2b,0x28,0x26,
+		0x24,0x22,0x20,0x1e,0x1c,0x1a,0x18,0x16,
+		0x14,0x13,0x11,0x10,0xe,0xd,0xb,0xa,
+		0x9,0x8,0x7,0x6,0x5,0x4,0x3,0x3,
+		0x2,0x2,0x1,0x1,0x0,0x0,0x0,0x0,
+		0x0,0x0,0x0,0x1,0x1,0x1,0x2,0x2,
+		0x3,0x4,0x4,0x5,0x6,0x7,0x8,0x9,
+		0xb,0xc,0xd,0xf,0x10,0x12,0x14,0x15,
+		0x17,0x19,0x1b,0x1d,0x1f,0x21,0x23,0x25,
+		0x27,0x2a,0x2c,0x2e,0x31,0x33,0x36,0x38,
+		0x3b,0x3e,0x40,0x43,0x46,0x49,0x4c,0x4f,
+		0x51,0x54,0x57,0x5a,0x5d,0x60,0x63,0x67,
+		0x6a,0x6d,0x70,0x73,0x76,0x79,0x7c,0x80 };
+
+/* Quick bit reversal Table */
+static const uint8_t BitReverseTable256[] =
+{
+  0x00, 0x80, 0x40, 0xC0, 0x20, 0xA0, 0x60, 0xE0, 0x10, 0x90, 0x50, 0xD0, 0x30, 0xB0, 0x70, 0xF0,
+  0x08, 0x88, 0x48, 0xC8, 0x28, 0xA8, 0x68, 0xE8, 0x18, 0x98, 0x58, 0xD8, 0x38, 0xB8, 0x78, 0xF8,
+  0x04, 0x84, 0x44, 0xC4, 0x24, 0xA4, 0x64, 0xE4, 0x14, 0x94, 0x54, 0xD4, 0x34, 0xB4, 0x74, 0xF4,
+  0x0C, 0x8C, 0x4C, 0xCC, 0x2C, 0xAC, 0x6C, 0xEC, 0x1C, 0x9C, 0x5C, 0xDC, 0x3C, 0xBC, 0x7C, 0xFC,
+  0x02, 0x82, 0x42, 0xC2, 0x22, 0xA2, 0x62, 0xE2, 0x12, 0x92, 0x52, 0xD2, 0x32, 0xB2, 0x72, 0xF2,
+  0x0A, 0x8A, 0x4A, 0xCA, 0x2A, 0xAA, 0x6A, 0xEA, 0x1A, 0x9A, 0x5A, 0xDA, 0x3A, 0xBA, 0x7A, 0xFA,
+  0x06, 0x86, 0x46, 0xC6, 0x26, 0xA6, 0x66, 0xE6, 0x16, 0x96, 0x56, 0xD6, 0x36, 0xB6, 0x76, 0xF6,
+  0x0E, 0x8E, 0x4E, 0xCE, 0x2E, 0xAE, 0x6E, 0xEE, 0x1E, 0x9E, 0x5E, 0xDE, 0x3E, 0xBE, 0x7E, 0xFE,
+  0x01, 0x81, 0x41, 0xC1, 0x21, 0xA1, 0x61, 0xE1, 0x11, 0x91, 0x51, 0xD1, 0x31, 0xB1, 0x71, 0xF1,
+  0x09, 0x89, 0x49, 0xC9, 0x29, 0xA9, 0x69, 0xE9, 0x19, 0x99, 0x59, 0xD9, 0x39, 0xB9, 0x79, 0xF9,
+  0x05, 0x85, 0x45, 0xC5, 0x25, 0xA5, 0x65, 0xE5, 0x15, 0x95, 0x55, 0xD5, 0x35, 0xB5, 0x75, 0xF5,
+  0x0D, 0x8D, 0x4D, 0xCD, 0x2D, 0xAD, 0x6D, 0xED, 0x1D, 0x9D, 0x5D, 0xDD, 0x3D, 0xBD, 0x7D, 0xFD,
+  0x03, 0x83, 0x43, 0xC3, 0x23, 0xA3, 0x63, 0xE3, 0x13, 0x93, 0x53, 0xD3, 0x33, 0xB3, 0x73, 0xF3,
+  0x0B, 0x8B, 0x4B, 0xCB, 0x2B, 0xAB, 0x6B, 0xEB, 0x1B, 0x9B, 0x5B, 0xDB, 0x3B, 0xBB, 0x7B, 0xFB,
+  0x07, 0x87, 0x47, 0xC7, 0x27, 0xA7, 0x67, 0xE7, 0x17, 0x97, 0x57, 0xD7, 0x37, 0xB7, 0x77, 0xF7,
+  0x0F, 0x8F, 0x4F, 0xCF, 0x2F, 0xAF, 0x6F, 0xEF, 0x1F, 0x9F, 0x5F, 0xDF, 0x3F, 0xBF, 0x7F, 0xFF
+};
+
+/* ---- Configurations ------ */
+
+void os_dac_FuncOn(void) {
+	// Interrupt on
+	TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+	//Timer_start(DAC);
+}
+
+void os_dac_FuncOff(void) {
+	// Interrupt off
+	TimerIntDisable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+	//Timer_stop(DAC);
+	// Set output to 0
+	os_dac_set_value(0);
+}
+
+void CheckDac(void) {
+	if (TurnOnDac == 1) {
+		TurnOnDac = 0;
+		os_dac_FuncOn();
+	}
+}
+// Note: Frequency Up and Down use a 'log' scale Moves in 100s then 1000s
+void os_dac_FreqUp(void) {
+	if (Frequency >= 1000) {
+		if ((Frequency + 1000) <= 25000) {
+			Frequency = Frequency + 1000;
+			os_dac_wave(WaveType, Frequency + 1000, Amplitude);
+		}
+	}
+	else if (Frequency >= 100) { // Frequency Range in 100s
+		Frequency = Frequency + 100;
+		os_dac_wave(WaveType, Frequency + 100, Amplitude);
+	}
+	else {
+		Frequency = Frequency + 10;
+		os_dac_wave(WaveType, Frequency + 10, Amplitude);
+	}
+}
+
+/*
+ * @brief	Decrement Frequency
+ */
+void os_dac_FreqDown(void) {
+	if (Frequency > 1000) {
+		Frequency = Frequency - 1000;
+		os_dac_wave(WaveType, Frequency - 1000, Amplitude);
+	}
+	else if (Frequency > 100) {
+		Frequency = Frequency - 100;
+		os_dac_wave(WaveType, Frequency - 100, Amplitude);
+	}
+	else {
+		if ((Frequency - 10) > 0) {
+			Frequency = Frequency - 10;
+			os_dac_wave(WaveType, Frequency - 10, Amplitude);
+		}
+	}
+
+}
+
+/*
+ * @brief	Used to only change the wave type
+ */
+void os_dac_WaveType(uint8_t wave) {
+	os_dac_wave(wave, Frequency, Amplitude);
+}
+
+/*
+ * @brief	User Configuration to increase Amplitude
+ */
+void os_dac_AmplitudeUp(void) {
+	if (Amplitude == (100 * 0xFF/3300)) { // 100mV
+		Amplitude = (200 * 0xFF / 3300);
+	}
+	else if (Amplitude == (200 * 0xFF/3300)) { // 200mV
+		Amplitude = (500 * 0xFF / 3300);
+	}
+	else if (Amplitude == (500 * 0xFF/3300)) { // 500mV
+		Amplitude = (100* 0xFF / 3300);
+	}
+	else if (Amplitude == (1000 * 0xFF / 3300)) { // 1V
+		Amplitude = (2000 * 0xFF / 3300);
+	}
+	else if (Amplitude == (2000 * 0xFF / 3300)) { // 2V
+		Amplitude = 0xFF;
+	}
+}
+
+/*
+ * @brief	User Configuration to decrease the Amplitude
+ */
+void os_dac_AmplitudeDown(void) {
+	if (Amplitude == 0xFF) { // 3V
+		Amplitude = (2000 * 0xFF / 3300);
+	}
+	else if (Amplitude == (200 * 0xFF/3300)) { // 200mV
+		Amplitude = (100 * 0xFF / 3300);
+	}
+	else if (Amplitude == (500 * 0xFF/3300)) { // 500mV
+		Amplitude = (200* 0xFF / 3300);
+	}
+	else if (Amplitude == (1000 * 0xFF / 3300)) { // 1V
+		Amplitude = (500 * 0xFF / 3300);
+	}
+	else if (Amplitude == (2000 * 0xFF / 3300)) { // 2V
+		Amplitude = (1000 * 0xFF / 3300);
+	}
+}
+/* --------------------------- */
+
+
+/*
+ * Setup GPIO pins for R-2R ladder
+ */
+void os_dac_init(void) {
+	/*
+	* R-2R Network
+	* PM7		a0 GPIO
+	* PM6		a1 GPIO
+	* PM5		a2 GPIO
+	* PM4		a3 GPIO
+	* PM3		a4 GPIO
+	* PM2		a5 GPIO
+	* PM1		a6 GPIO
+	* PM0		a7 GPIO
+	*
+	*/
+
+
+	SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOM);
+	GPIOPinTypeGPIOOutput(GPIO_PORTM_BASE, 0xFF); // Enable all pins as GPIO
+
+	SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER2);
+	TimerConfigure(TIMER2_BASE, TIMER_CFG_A_PERIODIC_UP);
+	TimerLoadSet(TIMER2_BASE, TIMER_A, 120); // Clock cycles per trigger (set to 1us)
+
+	IntEnable(INT_TIMER2A);
+	//TimerIntEnable(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
+	//IntMasterEnable();
+
+	TimerEnable(TIMER2_BASE, TIMER_A);
+	TimerIntClear(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+	IntEnable(INT_TIMER2A);
+
+	/* Set global variables */
+	PeriodIndex = 0;
+
+	os_dac_wave(SINE, 1000, 0xFF);
+}
+
+/*
+ * @breif 	Set value of dac. Optimized
+ * @params	value: Ratio of Vref from 0 to 255
+ * @retval 	None
+ */
+void os_dac_set_value(uint8_t value) {
+
+	// Scale
+	value = value * Amplitude / 0xFF ;
+	// Write to all pins
+	GPIOPinWrite(GPIO_PORTM_BASE, 0xFF, BitReverseTable256[value]);
+}
+
+
+volatile uint16_t lfsr = 0xA607; /* Random Start State */
+volatile uint16_t lsb;
+
+/*
+ * @brief Called if Timer 0 A triggered
+ */
+void os_dac_timer2A(void) {
+
+	TimerIntClear(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+
+	// Check Wave type
+	switch(WaveType) {
+		case OFF:
+			return;
+
+		case SINE:
+			os_dac_set_value((Amplitude*sine_look_up_table[(0xFF*PeriodIndex++)/IntsPerPeriod])/0xFF);
+			break;
+
+		case SQUARE:
+			if ((2*PeriodIndex++) < IntsPerPeriod) {
+				os_dac_set_value(Amplitude); // Change to Amplitude
+			}
+			else {
+				os_dac_set_value(0x00);
+			}
+			break;
+
+		case RAMP:
+			os_dac_set_value((Amplitude*PeriodIndex++)/IntsPerPeriod);
+			break;
+
+		case TRIANGLE:
+			if ((2*PeriodIndex++) < (IntsPerPeriod-2)) { 	// Go up
+				os_dac_set_value((Amplitude * 2 *PeriodIndex)/IntsPerPeriod);
+			} else {									// Go down
+				os_dac_set_value((Amplitude * 2 *(IntsPerPeriod-PeriodIndex)) / IntsPerPeriod );
+			}
+			break;
+
+		case RANDOM:
+			lsb = lfsr & 1;   			/* Get LSB (i.e., the output bit). */
+			lfsr >>= 1;                	/* Shift register */
+			lfsr ^= (-lsb) & 0xB400;
+			os_dac_set_value(lfsr * Amplitude / 0xFFFF);
+			break;
+
+		default: // Should never happen
+			return;
+	}
+
+	if (PeriodIndex > (IntsPerPeriod-1)) {
+		PeriodIndex = 0;
+	}
+	/* Interrupt User ocassionaly to process events */
+	if (userIntIndex++ >= 50000) {
+		InterruptUser();
+		userIntIndex = 0;
+
+		if ((userIntIndexSR++) > 10) {
+			TimerIntDisable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+			TurnOnDac = 1;
+		}
+	}
+}
+
+
+
+/*
+ * @brief 	Genererates a wave from on the DAC
+ * @parms 	type: Sine, Square etc.
+ * 			frequency: 1Hz - 25kHz
+ * 			amplitude: Ratio of Vref
+ */
+void os_dac_wave(uint8_t type, int frequency, uint8_t amplitude) {
+
+	const uint32_t intsPerSecond = 181098;//111050;//70836; // NOTE: This value depends on the final load on main()
+										  // 	  	current 5.5us
+
+	/* Set global variables */
+	PeriodIndex = 0;
+	WaveType = type;
+	Amplitude = amplitude;
+	Frequency = frequency; // This function must be run again to implement this
+
+	/* On or off */
+	if (WaveType == OFF) {
+		// Stop timers
+		os_dac_set_value(0);
+		return;
+	}
+
+	/* Convert Frequency to time delay */
+	//  (No. ints / period) = (No. ints / sec) * ( sec / period )
+
+	IntsPerPeriod = ( intsPerSecond ) / frequency;
+
+}
+
